@@ -1,4 +1,5 @@
 #!/usr/bin/perl -w
+
 ##############################################################################
 ## sendEmail
 ## Written by: Brandon Zehm <caspian@dotconf.net>
@@ -37,6 +38,7 @@
 ##############################################################################
 use strict;
 use IO::Socket;
+eval qq{ use Data::Dumper; 1 };
 
 
 ########################
@@ -46,11 +48,11 @@ use IO::Socket;
 my %conf = (
     ## General
     "programName"          => $0,                                  ## The name of this program
-    "version"              => '1.56',                              ## The version of this program
+    "version"              => '1.56.6',                            ## The version of this program
     "authorName"           => 'Brandon Zehm',                      ## Author's Name
     "authorEmail"          => 'caspian@dotconf.net',               ## Author's Email Address
     "timezone"             => '+0000',                             ## We always use +0000 for the time zone
-    "hostname"             => 'changeme',                          ## Used in printmsg() for all output (is updated later in the script).
+    "hostname"             => undef,                               ## Used in printmsg() for all output (is updated later in the script).
     "debug"                => 0,                                   ## Default debug level
     "error"                => '',                                  ## Error messages will often be stored here
     
@@ -60,7 +62,7 @@ my %conf = (
     "logFile"              => '',                                  ## If this is specified (form the command line via -l) this file will be used for logging.
     
     ## Network
-    "server"               => 'localhost',                         ## Default SMTP server
+    "server"               => undef,                               ## Default SMTP server
     "port"                 => 25,                                  ## Default port
     "bindaddr"             => '',                                  ## Default local bind address
     "alarm"                => '',                                  ## Default timeout for connects and reads, this gets set from $opt{'timeout'}
@@ -84,12 +86,14 @@ my %opt = (
     "message-file"         => '',                                  ## File to read message body from
     "message-header"       => '',                                  ## Additional email header line(s)
     "message-format"       => 'normal',                            ## If "raw" is specified the message is sent unmodified
-    "message-charset"      => 'iso-8859-1',                        ## Message character-set
+    "message-charset"      => 'UTF-8',                             ## Message character-set
     "message-content-type" => 'auto',                              ## auto, text, html or an actual string to put into the content-type header.
+    "dont-send-empty"      => 'no',
     
     ## Network
     "timeout"              => 60,                                  ## Default timeout for connects and reads, this is copied to $conf{'alarm'} later.
-    "fqdn"                 => 'changeme',                          ## FQDN of this machine, used during SMTP communication (is updated later in the script).
+    "fqdn"                 => undef,                               ## FQDN of this machine, used during SMTP communication (is updated later in the script).
+    "originating-ip"       => 'no',
     
     ## eSMTP
     "username"             => '',                                  ## Username used in SMTP Auth
@@ -114,6 +118,7 @@ my @attachments_names = ();
 ## For printing colors to the console
 my ${colorRed}    = "\033[31;1m";
 my ${colorGreen}  = "\033[32;1m";
+my ${colorBlue}   = "\033[34;1m";
 my ${colorCyan}   = "\033[36;1m";
 my ${colorWhite}  = "\033[37;1m";
 my ${colorNormal} = "\033[m";
@@ -157,25 +162,21 @@ sub initialize {
     $| = 1;
     
     ## Intercept signals
-    $SIG{'QUIT'}  = sub { quit("EXITING: Received SIG$_[0]", 1); };
-    $SIG{'INT'}   = sub { quit("EXITING: Received SIG$_[0]", 1); };
-    $SIG{'KILL'}  = sub { quit("EXITING: Received SIG$_[0]", 1); };
+    $SIG{'QUIT'}  = 
+    $SIG{'INT'}   = 
+    $SIG{'KILL'}  = 
     $SIG{'TERM'}  = sub { quit("EXITING: Received SIG$_[0]", 1); };
   
     ## ALARM and HUP signals are not supported in Win32
     unless ($^O =~ /win/i) {
-        $SIG{'HUP'}   = sub { quit("EXITING: Received SIG$_[0]", 1); };
+        $SIG{'HUP'}   = 
         $SIG{'ALRM'}  = sub { quit("EXITING: Received SIG$_[0]", 1); };
     }
     
     ## Fixup $conf{'programName'}
     $conf{'programName'} =~ s/(.)*[\/,\\]//;
     $0 = $conf{'programName'} . " " . join(" ", @ARGV);
-    
-    ## Fixup $conf{'hostname'} and $opt{'fqdn'}
-    if ($opt{'fqdn'} eq 'changeme') { $opt{'fqdn'} = get_hostname(1); }
-    if ($conf{'hostname'} eq 'changeme') { $conf{'hostname'} = $opt{'fqdn'}; $conf{'hostname'} =~ s/\..*//; }
-    
+
     return(1);
 }
 
@@ -189,6 +190,12 @@ sub initialize {
 
 
 
+sub test_tcp_socket {
+
+    return 1 if socket(SOCKET, PF_INET, SOCK_STREAM, getprotobyname("tcp")) and connect(SOCKET, sockaddr_in($_[1], inet_aton($_[0])));
+    return 0;
+
+}
 
 
 
@@ -210,6 +217,7 @@ sub processCommandLine {
     my $numargv = @ARGS;
     help() unless ($numargv);
     my $counter = 0;
+    my $readkeyCap = 0;
     
     for ($counter = 0; $counter < $numargv; $counter++) {
   
@@ -411,14 +419,28 @@ sub processCommandLine {
     ##  Verify required variables are set correctly  ##
     ###################################################
     
-    ## Make sure we have something in $conf{hostname} and $opt{fqdn}
-    if ($opt{'fqdn'} =~ /\./) {
-        $conf{'hostname'} = $opt{'fqdn'};
-        $conf{'hostname'} =~ s/\..*//;
-    }
+    ## Fixup $conf{'hostname'} and $opt{'fqdn'}
+    if (not defined $opt{'fqdn'}) { $opt{'fqdn'} = get_hostname(1); }
+    if (not defined $conf{'hostname'}) { $conf{'hostname'} = $opt{'fqdn'}; $conf{'hostname'} =~ s/\..*//; }
     
-    if (!$conf{'server'}) { $conf{'server'} = 'localhost'; }
+    if (!$from) {
+	    ## Guessing 'From' address
+	    my $from_userpart;
+	    if($^O =~ /win/i) {
+	    	$from_userpart = $ENV{'USERNAME'};
+	    }
+	    else {
+	    	$from_userpart = $ENV{'LOGNAME'};
+	    	if(!$from_userpart) { $from_userpart = $ENV{'USER'}; }
+	    }
+	    if(!$from_userpart) { $from_userpart = "nobody"; }
+	    $from =  $from_userpart . '@' . $opt{'fqdn'};
+    }
+
     if (!$conf{'port'})   { $conf{'port'} = 25; }
+    if ((!defined $conf{'server'}) and test_tcp_socket("localhost", $conf{'port'})) {
+    	$conf{'server'} = "localhost";
+    }
     if (!$from) {
         quit("ERROR => You must specify a 'from' field!  Try --help.", 1);
     }
@@ -455,8 +477,24 @@ sub processCommandLine {
             ## Prompt for a password since one wasn't specified with the -xp option.
             $SIG{'ALRM'} = sub { quit("ERROR => Timeout waiting for password inpupt", 1); };
             alarm(60) if ($^O !~ /win/i);  ## alarm() doesn't work in win32
-            print "Password: ";
+
+            if(eval qq{ use Term::ReadKey; 1 }) { $readkeyCap = 1 }
+            if($readkeyCap) {
+            	ReadMode('noecho');
+            } elsif($^O !~ /win/i) {
+            	system(qw/stty -echo/);
+            } else { printmsg("WARNING => Input chars will be shown!",0); }
+
+            print "Password for $opt{'username'}: ";
             $opt{'password'} = <STDIN>; chomp $opt{'password'};
+            
+            if($readkeyCap) {
+            	ReadMode(0);
+            	print "\n";
+            } elsif($^O !~ /win/i) {
+            	system(qw/stty echo/);
+            	print "\n";
+            }
             if (!$opt{'password'}) {
                 quit("ERROR => A username for SMTP authentication was specified, but no password!", 1);
             }
@@ -766,7 +804,7 @@ sub returnAddressParts {
     ## Make sure there aren't invalid characters in the address, and return it.
     my $ctrl        = '\000-\037';
     my $nonASCII    = '\x80-\xff';
-    if ($address =~ /[<> ,;:"'\[\]\\$ctrl$nonASCII]/) {
+    if ($address =~ /[<> ,;:""''\[\]\\$ctrl$nonASCII]/) {
         printmsg("WARNING => The address [$address] seems to contain invalid characters: continuing anyway", 0);
     }
     return($name, $address);
@@ -810,7 +848,7 @@ sub base64_encode {
     while ($data =~ s/(.{45})//s) {        ## Get 45 bytes from the binary string
         $tmp = substr(pack('u', $&), 1);   ## Convert the binary to uuencoded text
         chop($tmp);
-        $tmp =~ tr|` -_|AA-Za-z0-9+/|;     ## Translate from uuencode to base64
+        $tmp =~ tr|`` -_|AAA-Za-z0-9+/|;     ## Translate from uuencode to base64
         $base64 .= $tmp;
     }
     
@@ -822,7 +860,7 @@ sub base64_encode {
         $padding = (3 - length($data) % 3) % 3;    ## Set flag if binary data isn't divisible by 3
         $tmp = substr(pack('u', $data), 1);        ## Convert the binary to uuencoded text
         chop($tmp);
-        $tmp =~ tr|` -_|AA-Za-z0-9+/|;             ## Translate from uuencode to base64
+        $tmp =~ tr|`` -_|AAA-Za-z0-9+/|;             ## Translate from uuencode to base64
         $base64 .= $tmp;
     }
     
@@ -871,9 +909,12 @@ sub send_attachment {
     ##########################
     ## Autodetect Mime Type ##
     ##########################
+
+    ($content_type) = (`file -ib "$filename"` =~ /^([^;]+)/)[0];
+    unless($content_type) {
     
     @fields = split(/\./, $filename_name);
-    $encoding = $fields[$#fields];
+    $encoding = $fields[$#fields];	# (extension)
     
     if ($encoding =~ /txt|text|log|conf|^c$|cpp|^h$|inc|m3u/i) {   $content_type = 'text/plain';                      }
     elsif ($encoding =~ /html|htm|shtml|shtm|asp|php|cfm/i) {      $content_type = 'text/html';                       }
@@ -910,7 +951,7 @@ sub send_attachment {
     elsif ($encoding =~ /latex/i) {                                $content_type = 'application/x-latex';             }
     elsif ($encoding =~ /vcf/i) {                                  $content_type = 'application/x-vcard';             }
     else { $content_type = 'application/octet-stream';  }
-  
+    }
   
   ############################
   ## Process the attachment ##
@@ -951,7 +992,7 @@ sub send_attachment {
         while ($res =~ s/(.{45})//s) {         ## Get 45 bytes from the binary string
             $tmp = substr(pack('u', $&), 1);   ## Convert the binary to uuencoded text
             chop($tmp);
-            $tmp =~ tr|` -_|AA-Za-z0-9+/|;     ## Translate from uuencode to base64
+            $tmp =~ tr|`` -_|AAA-Za-z0-9+/|;     ## Translate from uuencode to base64
             $base64 .= $tmp;
         }
         
@@ -972,7 +1013,7 @@ sub send_attachment {
         $padding = (3 - length($res) % 3) % 3;  ## Set flag if binary data isn't divisible by 3
         $res = substr(pack('u', $res), 1);      ## Convert the binary to uuencoded text
         chop($res);
-        $res =~ tr|` -_|AA-Za-z0-9+/|;          ## Translate from uuencode to base64
+        $res =~ tr|`` -_|AAA-Za-z0-9+/|;          ## Translate from uuencode to base64
     }
     
     ############################
@@ -1005,7 +1046,7 @@ sub send_attachment {
 
 
 ###############################################################################################
-##  Function:    $string = get_hostname (boot $fqdn)
+##  Function:    $string = get_hostname (bool $fqdn)
 ##  
 ##  Description: Tries really hard to returns the short (or FQDN) hostname of the current
 ##               system.  Uses techniques and code from the  Sys-Hostname module.
@@ -1017,7 +1058,7 @@ sub send_attachment {
 ###############################################################################################
 sub get_hostname {
     ## Assign incoming parameters to variables
-    my ( $fqdn ) = @_;
+    my ( $return_fqdn ) = @_;
     my $hostname = "";
     
     ## STEP 1: Get short hostname
@@ -1031,27 +1072,29 @@ sub get_hostname {
     ## If that didn't get us a hostname, try a few other things
     else {
         ## Windows systems
-        if ($^O !~ /win/i) {
+        if ($^O =~ /win/i) {
             if ($ENV{'COMPUTERNAME'}) { $hostname = $ENV{'COMPUTERNAME'}; }
             if (!$hostname) { $hostname = gethostbyname('localhost'); }
-            if (!$hostname) { chomp($hostname = `hostname 2> NUL`) };
+            if (!$hostname) { chomp($hostname = `hostname 2>NUL:`) };
         }
         
         ## Unix systems
         else {
-            local $ENV{PATH} = '/usr/bin:/bin:/usr/sbin:/sbin';  ## Paranoia
+            local $ENV{'PATH'} = '/usr/bin:/bin:/usr/sbin:/sbin';  ## Paranoia
             
-            ## Try the environment first (Help!  What other variables could/should I be checking here?)
+            ## Try the environment first
             if ($ENV{'HOSTNAME'}) { $hostname = $ENV{'HOSTNAME'}; }
             
             ## Try the hostname command
-            eval { local $SIG{__DIE__}; local $SIG{CHLD}; $hostname = `hostname 2>/dev/null`; chomp($hostname); } ||
+            eval { local $SIG{__DIE__}; local $SIG{CHLD}; $hostname = `hostname`; $hostname =~ s/\s*$//; } ||
             
             ## Try POSIX::uname(), which strictly can't be expected to be correct
             eval { local $SIG{__DIE__}; require POSIX; $hostname = (POSIX::uname())[1]; } ||
             
             ## Try the uname command
-            eval { local $SIG{__DIE__}; $hostname = `uname -n 2>/dev/null`; chomp($hostname); };
+            eval { local $SIG{__DIE__}; $hostname = `uname -n`; $hostname =~ s/\s*$//; } ||
+            
+            eval { open my $fh, "/etc/hostname"; $hostname = <$fh>; close $fh; $hostname =~ s/\s*$//; };
             
         }
         
@@ -1062,21 +1105,23 @@ sub get_hostname {
         }
     }
     
+    $hostname = lc $hostname;
+    
     ## Return the short hostname
-    unless ($fqdn) {
+    unless ($return_fqdn) {
         $hostname =~ s/\..*//;
-        return(lc($hostname));
+        return $hostname;
     }
     
     ## STEP 2: Determine the FQDN
     
     ## First, if we already have one return it.
-    if ($hostname =~ /\w\.\w/) { return(lc($hostname)); }
+    if ($hostname =~ /\w\.\w/) { return $hostname; }
     
     ## Next try using 
+    my $fqdn;
     eval { $fqdn = (gethostbyname($hostname))[0]; };
-    if ($fqdn) { return(lc($fqdn)); }
-    return(lc($hostname));
+    return lc($fqdn);
 }
 
 
@@ -1281,27 +1326,26 @@ print <<EOM;
 
 ${colorBold}$conf{'programName'}-$conf{'version'} by $conf{'authorName'} <$conf{'authorEmail'}>${colorNoBold}
 
-Synopsis:  $conf{'programName'} -f ADDRESS [options]
+Synopsis:  $conf{'programName'} -f ADDRESS -t ADDRESS -u SUBJECT -m "MESSAGE" [options]
 
-  ${colorRed}Required:${colorNormal}
+
+  ${colorBlue}Common:${colorNormal}
     -f ADDRESS                from (sender) email address
-    * At least one recipient required via -t, -cc, or -bcc
-    * Message body required via -m, STDIN, or -o message-file=FILE
-
-  ${colorGreen}Common:${colorNormal}
     -t ADDRESS [ADDR ...]     to email address(es)
     -u SUBJECT                message subject
     -m MESSAGE                message body
-    -s SERVER[:PORT]          smtp mail relay, default is $conf{'server'}:$conf{'port'}
+    -s SERVER[:PORT]          smtp mail relay, default is localhost:$conf{'port'}
+      * At least one recipient required via -t, -cc, or -bcc
+      * Message body required via -m, STDIN, or -o message-file=FILE
 
-  ${colorGreen}Optional:${colorNormal}
+  ${colorBlue}Optional:${colorNormal}
     -a   FILE [FILE ...]      file attachment(s)
     -cc  ADDRESS [ADDR ...]   cc  email address(es)
     -bcc ADDRESS [ADDR ...]   bcc email address(es)
     -xu  USERNAME             username for SMTP authentication
     -xp  PASSWORD             password for SMTP authentication
 
-  ${colorGreen}Paranormal:${colorNormal}
+  ${colorBlue}Paranormal:${colorNormal}
     -b BINDADDR[:PORT]        local host bind address
     -l LOGFILE                log to the specified file
     -v                        verbosity, use multiple times for greater effect
@@ -1310,12 +1354,13 @@ Synopsis:  $conf{'programName'} -f ADDRESS [options]
         -o message-content-type=<auto|text|html>
         -o message-file=FILE         -o message-format=raw
         -o message-header=HEADER     -o message-charset=CHARSET
+        -o dont-send-empty=<yes|no>  -o originating-ip=<yes|no>
         -o reply-to=ADDRESS          -o timeout=SECONDS
         -o username=USERNAME         -o password=PASSWORD
         -o tls=<auto|yes|no>         -o fqdn=FQDN
 
 
-  ${colorGreen}Help:${colorNormal}
+  ${colorBlue}Help:${colorNormal}
     --help                    the helpful overview you're reading now
     --help addressing         explain addressing and related options
     --help message            explain message body input and related options
@@ -1327,7 +1372,7 @@ EOM
 exit(1);
 }
 
-
+# ' # mcedit sux
 
 
 
@@ -1423,7 +1468,7 @@ EOM
         };
 
 
-
+# '
 
 
 
@@ -1509,7 +1554,7 @@ Options related to the email message body:
 
 -o message-charset=CHARSET
     This option allows you to specify the character-set for the message body.
-    The default is iso-8859-1.
+    The default is UTF-8.
 
 -o message-format=raw
     This option instructs sendEmail to assume the message (specified with -m,
@@ -1572,6 +1617,7 @@ Options that don't fit anywhere else:
     -o   tls=<auto|yes|no>
     -o   timeout=SECONDS
     -o   fqdn=FQDN
+    -o   dont-send-empty=<yes|no>
 
 -a   ATTACHMENT [ATTACHMENT ...]
     This option allows you to attach any number of files to your email message.
@@ -1612,8 +1658,12 @@ Options that don't fit anywhere else:
     need to manually set it for some reason or get a warning about detection
     failing, you can use this to override the default.
 
+-o   dont-send-empty=<yes|no>
+    Do not send message if it would be empty. Useful for scripts.
+
 
 EOM
+# '
             last CASE;
         };
 
@@ -1669,6 +1719,9 @@ Options related to networking:
 -o timeout=SECONDS
     This option sets the timeout value in seconds used for all network reads,
     writes, and a few other things.
+
+-o originating-ip=<yes|no>
+    This option sets the X-Originating-IP header, which unset by default.
 
     
 EOM
@@ -1784,7 +1837,7 @@ if (!($message)) {
             printmsg("HINT => Check permissions on file specified to ensure it can be read", 1);
             quit("", 1);
         }
-        if (!open(MFILE, "< " . $opt{'message-file'})) {
+        if (!open(MFILE, '<', $opt{'message-file'})) {
             printmsg("ERROR => Error opening message body file [$opt{'message-file'}]: $!", 0);
             quit("", 1);
         }
@@ -1811,6 +1864,9 @@ if (!($message)) {
         printmsg("Message input complete.", 0);
     }
 }
+if($opt{'dont-send-empty'} =~ /^yes|true|1$/i  && (join '', split/[\r\n]/, $message) =~ /^\s*$/) {
+    quit("DEBUG => Empty message body.", 3);
+}
 
 ## Replace bare LF's with CRLF's (\012 should always have \015 with it)
 $message =~ s/(\015)?(\012|$)/\015\012/g;
@@ -1832,7 +1888,32 @@ my $date = sprintf("%s, %s %s %d %.2d:%.2d:%.2d %s",$day, $mday, $mon, $year, $h
 ##################################
 ##  Connect to the SMTP server  ##
 ##################################
-printmsg("DEBUG => Connecting to $conf{'server'}:$conf{'port'}", 1);
+
+	### Figure out destination domain's MX ###
+
+	my $domain_part = (returnAddressParts($to[0])=~/@(.*)/)[0];
+	if (!defined $conf{'server'} or $conf{'server'} eq 'AUTO') {
+		printmsg("WARNING => Relay server name not given, attempt to find an MX server.", 1);
+		eval qq{ use Net::DNS; 1 } or quit($@, 1);
+		for my $possible_mx (mx($domain_part)) {
+			if(test_tcp_socket($possible_mx->{'exchange'}, $conf{'port'})) {	# FIXME: alarm
+				$conf{'server'} = $possible_mx->{'exchange'};
+				last;
+			}
+		}
+	}
+	if (!defined $conf{'server'} or $conf{'server'} eq 'AUTO') {
+		printmsg("ERROR => No Mail eXchanger found for domain $domain_part.", 0);
+		printmsg("HINT => Try specifying a mail relay with the -s option.", 1);
+		quit("", 1);
+	}
+
+my $resolved;
+if($conf{'server'} !~ /^\d+\.\d+\.\d+\.\d+$/) {
+	$resolved = inet_ntoa( (gethostbyname($conf{'server'}))[4] );
+	$resolved = " [$resolved]";
+}
+printmsg("DEBUG => Connecting to $conf{'server'}:$conf{'port'}".$resolved, 1);
 $SIG{'ALRM'} = sub { 
     printmsg("ERROR => Timeout while connecting to $conf{'server'}:$conf{'port'}  There was no response after $conf{'alarm'} seconds.", 0); 
     printmsg("HINT => Try specifying a different mail relay with the -s option.", 1);
@@ -1903,7 +1984,7 @@ else {
     if ($conf{'tls_server'} == 1 and $conf{'tls_client'} == 1 and $opt{'tls'} =~ /^(yes|auto)$/) {
         printmsg("DEBUG => Starting TLS", 2);
         if (SMTPchat('STARTTLS')) { quit($conf{'error'}, 1); }
-        if (! IO::Socket::SSL->start_SSL($SERVER, SSL_version => 'SSLv3 TLSv1')) {
+        if (! IO::Socket::SSL->start_SSL($SERVER, SSL_version => 'TLSv1')) {	# SSLv3 TLSv1
             quit("ERROR => TLS setup failed: " . IO::Socket::SSL::errstr(), 1);
         }
         printmsg("DEBUG => TLS: Using cipher: ". $SERVER->get_cipher(), 3);
@@ -2086,9 +2167,9 @@ else {
         $header .= 'X-Mailer: sendEmail-'.$conf{'version'}.$CRLF;    ## X-Mailer
     }
     ## I wonder if I should put this in by default?
-    # if ($opt{'message-header'} !~ /^X-Originating-IP:/iom) {
-    #     $header .= 'X-Originating-IP: ['.$conf{'ip'}.']'.$CRLF;      ## X-Originating-IP
-    # }
+    if ($opt{'originating-ip'} =~ /^yes|true|1$/i && $opt{'message-header'} !~ /^X-Originating-IP:/iom) {
+        $header .= 'X-Originating-IP: ['.$conf{'ip'}.']'.$CRLF;      ## X-Originating-IP
+    }
     
     ## Encode all messages with MIME.
     if ($opt{'message-header'} !~ /^MIME-Version:/iom) {
@@ -2097,7 +2178,7 @@ else {
     if ($opt{'message-header'} !~ /^Content-Type:/iom) {
         my $content_type = 'multipart/mixed';
         if (scalar(@attachments) == 0) { $content_type = 'multipart/related'; }
-        $header .= "Content-Type: $content_type; boundary=\"$conf{'delimiter'}\"$CRLF";
+        $header .= "Content-Type: $content_type; boundary=\"$conf{'delimiter'}\"; charset=\"UTF-8\"$CRLF";
     }
     
     ## Send additional message header line(s) if specified
@@ -2124,15 +2205,20 @@ else {
     ## Otherwise assume it's plain text...
     elsif ($opt{'message-content-type'} eq 'text' or $opt{'message-content-type'} eq 'auto') {
         printmsg("Setting content-type: text/plain", 1);
-        print $SERVER "Content-Type: text/plain;$CRLF";
+        print $SERVER "Content-Type: text/plain; ";
     }
     ## If they've specified their own content-type string...
     else {
         printmsg("Setting custom content-type: ".$opt{'message-content-type'}, 1);
-        print $SERVER "Content-Type: ".$opt{'message-content-type'}.";$CRLF";
+        print $SERVER "Content-Type: ".$opt{'message-content-type'}."; ";
     }
-    print $SERVER "        charset=\"" . $opt{'message-charset'} . "\"$CRLF";
-    print $SERVER "Content-Transfer-Encoding: 7bit$CRLF";
+    print $SERVER "charset=\"" . $opt{'message-charset'} . "\"$CRLF";
+    if($opt{'message-header'} =~ /quoted-printable/) {
+	print $SERVER "Content-Transfer-Encoding: quoted-printable$CRLF";
+    }
+    else {
+	print $SERVER "Content-Transfer-Encoding: 7bit$CRLF";
+    }
     print $SERVER $CRLF . $message;
     
     
