@@ -175,7 +175,7 @@ sub initialize {
     
     ## Fixup $conf{'programName'}
     $conf{'programName'} =~ s/(.)*[\/,\\]//;
-    $0 = $conf{'programName'} . " " . join(" ", @ARGV);
+    $0 = $conf{'programName'};
 
     return(1);
 }
